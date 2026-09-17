@@ -1,0 +1,670 @@
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║  SCANNER v2 — Buscador de sonido real de emotes (EVADE)      ║
+-- ║  Standalone. NO reemplaza ni depende de scanner_sonido_      ║
+-- ║  emotes.lua ni de tus otros scripts.                         ║
+-- ╚══════════════════════════════════════════════════════════════╝
+--
+-- QUÉ CAMBIA respecto a la v1:
+--
+-- SECCIÓN A: además de detectar Sound NUEVOS, ahora también
+-- escucha cambios de SoundId en una instancia ya existente
+-- (GetPropertyChangedSignal). Esto es porque el juego puede
+-- reutilizar el mismo "EmoteSound" y solo cambiarle el SoundId
+-- entre un emote y otro, en vez de destruirlo y crear uno nuevo
+-- — con la v1 eso se podía perder.
+--
+-- SECCIÓN B: ahora busca en TODOS los servicios que un LocalScript
+-- puede ver desde el cliente (Workspace, ReplicatedStorage,
+-- ReplicatedFirst, Lighting, SoundService, StarterGui, Teams).
+-- IMPORTANTE — límite real, no una suposición: ServerScriptService
+-- y ServerStorage NO se replican al cliente, así que un script del
+-- lado del cliente no puede ver su contenido aunque exista en el
+-- juego. Si el ID no aparece en ningún lado de acá, o vive en uno
+-- de esos dos servicios (inaccesible), o se genera 100% en runtime
+-- sin quedar guardado en ninguna instancia fija.
+-- Busca coincidencias en: Sound.SoundId, StringValue.Value, y
+-- Attributes de cualquier instancia. Todo por tandas con task.wait
+-- para no trabar/crashear.
+-- Podés buscar un ID pegado a mano, o tocar "Buscar TODOS los
+-- capturados" para repetir la búsqueda con cada ID que ya viste
+-- en la Sección A.
+--
+-- SECCIÓN C: agrega algo que la v1 no probaba — el extractor
+-- original solo mira instancias Sound colgadas del ModuleScript
+-- del emote. Pero el dato también podría estar adentro de la
+-- TABLA que devuelve ese ModuleScript al hacer require() (no como
+-- instancia, como valor Lua). Esta sección busca el módulo del
+-- emote por nombre interno, lo requiere con pcall, y vuelca su
+-- contenido (strings/números/tablas anidadas) al log para
+-- inspeccionarlo a simple vista.
+
+local Players = game:GetService("Players")
+local lp = Players.LocalPlayer
+
+-- ── ESTADO ────────────────────────────────────────────────────
+local State = {
+    paused     = false,
+    entries    = {},
+    scanning   = false,
+    capturedIds = {},   -- set: [id] = true, en orden de aparición también en capturedOrder
+    capturedOrder = {},
+}
+
+local watcherConn = nil
+local connectedSounds = setmetatable({}, { __mode = "k" })
+local logLabel = nil
+local scroll = nil
+
+-- ── LOG ───────────────────────────────────────────────────────
+local function refreshLogUI()
+    if not logLabel then return end
+    logLabel.Text = table.concat(State.entries, "\n")
+    task.defer(function()
+        if scroll then
+            scroll.CanvasPosition = Vector2.new(0, math.huge)
+        end
+    end)
+end
+
+local function addLog(text)
+    if State.paused then return end
+    table.insert(State.entries, text)
+    if #State.entries > 400 then
+        table.remove(State.entries, 1)
+    end
+    refreshLogUI()
+end
+
+local function registerCapturedId(id)
+    if id == "" or id == "rbxassetid://" then return end
+    if not State.capturedIds[id] then
+        State.capturedIds[id] = true
+        table.insert(State.capturedOrder, id)
+    end
+end
+
+-- ── SECCIÓN A: WATCHER DE SONIDO REAL (con soporte reutilización) ──
+local function findOwnCharModel()
+    local playersFolder = workspace:FindFirstChild("Players")
+    if not playersFolder then return nil, "No existe workspace.Players" end
+    local charModel = playersFolder:FindFirstChild(lp.Name)
+    if not charModel then return nil, "No encuentro workspace.Players." .. lp.Name end
+    return charModel, nil
+end
+
+-- Nombres de Sound que NO son emotes (movimiento normal del personaje).
+-- Se filtra por Name, no por SoundId, porque IDs como FootstepSound
+-- cambian todo el tiempo (superficie/pisada) pero el Name es estable.
+local EXCLUDED_SOUND_NAMES = {
+    SlideSound    = true,
+    FootstepSound = true,
+    Whoosh        = true,
+    DoubleJump    = true,
+    Equip         = true,
+    Death         = true,
+    DeathHeavy    = true,
+}
+
+local function hookSoundInstance(inst)
+    if EXCLUDED_SOUND_NAMES[inst.Name] then return end
+    if connectedSounds[inst] then return end
+    connectedSounds[inst] = true
+
+    local function report(tag)
+        local id = tostring(inst.SoundId)
+        registerCapturedId(id)
+        addLog(("[%s] %s | SoundId=%s | %s"):format(tag, inst.Name, id, inst:GetFullName()))
+    end
+
+    report("SONIDO")
+    inst:GetPropertyChangedSignal("SoundId"):Connect(function()
+        report("SONIDO-CAMBIO")
+    end)
+end
+
+local function startWatch()
+    if watcherConn then return end
+    local charModel, err = findOwnCharModel()
+    if not charModel then
+        addLog("[ERROR] " .. err .. " (¿ya entraste a una partida?)")
+        return
+    end
+
+    -- Hookear los Sound que ya existan ahora mismo
+    for _, inst in ipairs(charModel:GetDescendants()) do
+        if inst:IsA("Sound") then hookSoundInstance(inst) end
+    end
+
+    watcherConn = charModel.DescendantAdded:Connect(function(inst)
+        if inst:IsA("Sound") then
+            task.defer(function() hookSoundInstance(inst) end)
+        end
+    end)
+
+    addLog("[OK] Escuchando (nuevo + cambios) en " .. charModel:GetFullName())
+    addLog("     Ahora jugá un emote real desde el menú del juego.")
+end
+
+local function stopWatch()
+    if watcherConn then
+        watcherConn:Disconnect()
+        watcherConn = nil
+    end
+    addLog("[OK] Watcher detenido.")
+end
+
+-- ── SECCIÓN B: BÚSQUEDA MULTI-RAÍZ POR PARTES ────────────────
+local function getAccessibleRoots()
+    -- Solo servicios que SÍ se replican al cliente. ServerScriptService
+    -- y ServerStorage no están acá a propósito: un LocalScript no puede
+    -- verlos, no es que nos olvidamos de buscarlos.
+    local names = {
+        "Workspace", "ReplicatedStorage", "ReplicatedFirst",
+        "Lighting", "SoundService", "StarterGui", "Teams",
+    }
+    local roots = {}
+    for _, n in ipairs(names) do
+        local ok, svc = pcall(function() return game:GetService(n) end)
+        if ok and svc then table.insert(roots, { name = n, inst = svc }) end
+    end
+    return roots
+end
+
+local function instanceMatches(inst, targetSet)
+    if inst:IsA("Sound") then
+        local id = tostring(inst.SoundId)
+        if targetSet[id] then return "Sound.SoundId", id end
+    elseif inst:IsA("StringValue") then
+        local v = tostring(inst.Value)
+        if targetSet[v] then return "StringValue.Value", v end
+    end
+    local ok, attrs = pcall(function() return inst:GetAttributes() end)
+    if ok and attrs then
+        for k, v in pairs(attrs) do
+            local vs = tostring(v)
+            if targetSet[vs] then return "Attribute:" .. k, vs end
+        end
+    end
+    return nil
+end
+
+local function scanRootsForIds(targetList)
+    if State.scanning then
+        addLog("[AVISO] Ya hay una búsqueda en curso, esperá a que termine.")
+        return
+    end
+    if #targetList == 0 then
+        addLog("[ERROR] No hay ningún ID para buscar todavía.")
+        return
+    end
+
+    local targetSet = {}
+    for _, id in ipairs(targetList) do targetSet[id] = true end
+
+    State.scanning = true
+    addLog(("[BUSCANDO] %d ID(s) en todas las rutas accesibles del cliente..."):format(#targetList))
+
+    task.spawn(function()
+        local roots = getAccessibleRoots()
+        local totalMatches = 0
+
+        for _, root in ipairs(roots) do
+            addLog("[RAÍZ] " .. root.name .. " ...")
+            local ok, all = pcall(function() return root.inst:GetDescendants() end)
+            if not ok then
+                addLog("  [ERROR] No se pudo listar " .. root.name)
+            else
+                local total = #all
+                local CHUNK = 300
+                for i = 1, total do
+                    local inst = all[i]
+                    local ok2, kind, val = pcall(instanceMatches, inst, targetSet)
+                    if ok2 and kind then
+                        totalMatches = totalMatches + 1
+                        addLog(("  [MATCH %d] %s = %s | %s"):format(totalMatches, kind, val, inst:GetFullName()))
+                    end
+                    if i % CHUNK == 0 then
+                        task.wait()
+                    end
+                end
+                addLog(("  [OK] %s revisado (%d instancias)."):format(root.name, total))
+            end
+            task.wait()
+        end
+
+        if totalMatches == 0 then
+            addLog("[FIN] Ningún ID apareció como Sound/StringValue/Attribute en ninguna raíz accesible.")
+            addLog("      No implica que no exista — puede estar en ServerScriptService/ServerStorage")
+            addLog("      (inaccesibles desde el cliente) o generarse en runtime sin quedar guardado.")
+        else
+            addLog(("[FIN] Búsqueda terminada. %d coincidencia(s) en total."):format(totalMatches))
+        end
+        State.scanning = false
+    end)
+end
+
+-- ── SECCIÓN C: INSPECCIONAR MÓDULO DEL EMOTE (require) ───────
+local function findEmoteModule(emoteName)
+    local RS = game:GetService("ReplicatedStorage")
+    local roots = {}
+    local items = RS:FindFirstChild("Items")
+    if items then
+        local packs = items:FindFirstChild("ItemPacks")
+        if packs then table.insert(roots, packs) end
+        local baseItems = items:FindFirstChild("BaseItems")
+        if baseItems then table.insert(roots, baseItems) end
+    end
+    table.insert(roots, RS)
+
+    for _, root in ipairs(roots) do
+        for _, inst in ipairs(root:GetDescendants()) do
+            if inst.ClassName == "ModuleScript" and inst.Name == emoteName then
+                return inst
+            end
+        end
+    end
+    return nil
+end
+
+local function dumpValue(v, indent, depth, out)
+    if depth > 4 then
+        table.insert(out, indent .. "...(demasiado profundo, corto acá)")
+        return
+    end
+    local t = typeof(v)
+    if t == "table" then
+        local any = false
+        for k, val in pairs(v) do
+            any = true
+            local kt = tostring(k)
+            local vt = typeof(val)
+            if vt == "table" then
+                table.insert(out, indent .. kt .. ":")
+                dumpValue(val, indent .. "  ", depth + 1, out)
+            elseif vt == "Instance" then
+                table.insert(out, indent .. kt .. " = <" .. val.ClassName .. " " .. val.Name .. ">")
+            else
+                table.insert(out, indent .. kt .. " = " .. tostring(val))
+            end
+        end
+        if not any then table.insert(out, indent .. "(tabla vacía)") end
+    else
+        table.insert(out, indent .. tostring(v))
+    end
+end
+
+local function inspectModule(emoteName)
+    if emoteName == "" then
+        addLog("[ERROR] Escribí el nombre interno del emote primero (ej: Griddy).")
+        return
+    end
+    addLog("[INSPECCIONANDO] " .. emoteName .. " ...")
+    local mod = findEmoteModule(emoteName)
+    if not mod then
+        addLog("[ERROR] No encontré ningún ModuleScript llamado " .. emoteName .. ".")
+        return
+    end
+    addLog("[OK] Módulo encontrado: " .. mod:GetFullName())
+
+    local ok, result = pcall(require, mod)
+    if not ok then
+        addLog("[ERROR] require() falló: " .. tostring(result))
+        return
+    end
+
+    local out = {}
+    dumpValue(result, "  ", 1, out)
+    if #out == 0 then
+        addLog("[OK] El módulo no devolvió una tabla con contenido (o devolvió algo simple).")
+    else
+        addLog("[CONTENIDO DEL MÓDULO]")
+        for _, line in ipairs(out) do
+            addLog(line)
+            if line:lower():find("rbxassetid") then
+                addLog("     ^ contiene un rbxassetid, revisar esta línea")
+            end
+        end
+    end
+end
+
+-- ── GUI (ventana propia, sin librerías externas) ─────────────
+-- Estilo "glassy pill" blanco y negro, tomado de HideGuis-7.lua
+-- (glow animado + gradiente diagonal), sin colores semánticos.
+-- Textos localizados con LocalizationService (Roblox detecta el
+-- idioma del dispositivo del usuario, no hace falta que el usuario
+-- configure nada).
+
+local TweenService       = game:GetService("TweenService")
+local LocalizationService = game:GetService("LocalizationService")
+
+-- ── IDIOMA: detectado automáticamente vía Roblox ─────────────
+local STRINGS = {
+    es = {
+        title         = "SCANNER — SONIDO EMOTES",
+        start         = "Iniciar",
+        stop          = "Detener",
+        pause         = "Pausar",
+        resume        = "Reanudar",
+        clear         = "Limpiar",
+        copy          = "Copiar",
+        sectionB      = "Sección B — buscar SoundId:",
+        placeholderB  = "rbxassetid://... (vacío = capturados)",
+        scanOne       = "Buscar este ID",
+        scanAll       = "Buscar TODOS los capturados",
+        sectionC      = "Sección C — inspeccionar módulo:",
+        placeholderC  = "Nombre interno, ej: Griddy",
+        inspect       = "Inspeccionar módulo",
+        logPlaceholder = "Tocá 'Iniciar' y jugá un emote real.",
+    },
+    en = {
+        title         = "SCANNER — EMOTE SOUND",
+        start         = "Start",
+        stop          = "Stop",
+        pause         = "Pause",
+        resume        = "Resume",
+        clear         = "Clear",
+        copy          = "Copy",
+        sectionB      = "Section B — search SoundId:",
+        placeholderB  = "rbxassetid://... (empty = captured)",
+        scanOne       = "Search this ID",
+        scanAll       = "Search ALL captured",
+        sectionC      = "Section C — inspect emote module:",
+        placeholderC  = "Internal name, e.g: Griddy",
+        inspect       = "Inspect module",
+        logPlaceholder = "Tap 'Start' and play a real emote.",
+    },
+}
+
+local lang = "en"
+do
+    local ok, robloxLocale = pcall(function()
+        return LocalizationService.RobloxLocaleId
+    end)
+    if ok and robloxLocale and robloxLocale:sub(1, 2):lower() == "es" then
+        lang = "es"
+    end
+end
+local T = STRINGS[lang]
+
+local BG_FRAME  = Color3.fromRGB(14, 14, 16)
+local BG_PANEL  = Color3.fromRGB(24, 24, 27)
+local WHITE     = Color3.fromRGB(245, 245, 245)
+local GRAY_TEXT = Color3.fromRGB(190, 190, 195)
+local GRAY_DARK = Color3.fromRGB(60, 60, 65)
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "_ScannerSonidoEmotes"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = lp:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(230, 345)
+frame.Position = UDim2.new(0, 10, 0.05, 0)
+frame.BackgroundColor3 = BG_FRAME
+frame.BackgroundTransparency = 0.08
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = ScreenGui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 14)
+
+-- Overlay diagonal "glassy" en escala de grises (igual a HideGuis)
+local glassy = Instance.new("UIGradient")
+glassy.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(70, 70, 75)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(30, 30, 33)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(70, 70, 75)),
+})
+glassy.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0,   0.55),
+    NumberSequenceKeypoint.new(0.5, 0.25),
+    NumberSequenceKeypoint.new(1,   0.55),
+})
+glassy.Rotation = 90
+glassy.Parent = frame
+
+-- Borde animado (mismo efecto sweep + pulse que HideGuis, en blanco/gris)
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 1.4
+stroke.Color = WHITE
+stroke.Transparency = 0.35
+stroke.LineJoinMode = Enum.LineJoinMode.Round
+stroke.Parent = frame
+
+local strokeGrad = Instance.new("UIGradient")
+strokeGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   GRAY_DARK),
+    ColorSequenceKeypoint.new(0.5, WHITE),
+    ColorSequenceKeypoint.new(1,   GRAY_DARK),
+})
+strokeGrad.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0,   0.4),
+    NumberSequenceKeypoint.new(0.5, 0),
+    NumberSequenceKeypoint.new(1,   0.4),
+})
+strokeGrad.Offset = Vector2.new(-1.5, 0)
+strokeGrad.Parent = stroke
+
+TweenService:Create(
+    strokeGrad,
+    TweenInfo.new(1.6, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false),
+    { Offset = Vector2.new(1.5, 0) }
+):Play()
+
+TweenService:Create(
+    stroke,
+    TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    { Transparency = 0.1 }
+):Play()
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -16, 0, 16)
+title.Position = UDim2.new(0, 8, 0, 5)
+title.BackgroundTransparency = 1
+title.Text = T.title
+title.Font = Enum.Font.GothamBlack
+title.TextSize = 9
+title.TextColor3 = WHITE
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = frame
+
+-- Fila de botones Sección A
+local function makeSmallBtn(text, xOffset, yOffset, width, primary)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, width, 0, 20)
+    b.Position = UDim2.new(0, xOffset, 0, yOffset)
+    b.BackgroundColor3 = primary and WHITE or BG_PANEL
+    b.BackgroundTransparency = primary and 0 or 0.05
+    b.BorderSizePixel = 0
+    b.Text = text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 8
+    b.TextColor3 = primary and Color3.fromRGB(15, 15, 15) or GRAY_TEXT
+    b.Parent = frame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    local st = Instance.new("UIStroke")
+    st.Thickness = 1
+    st.Color = WHITE
+    st.Transparency = primary and 1 or 0.75
+    st.Parent = b
+    return b
+end
+
+local btnStart = makeSmallBtn(T.start, 8, 26, 44, true)
+local btnStop  = makeSmallBtn(T.stop, 55, 26, 44, false)
+local btnPause = makeSmallBtn(T.pause, 102, 26, 44, false)
+local btnClear = makeSmallBtn(T.clear, 149, 26, 38, false)
+local btnCopy  = makeSmallBtn(T.copy, 190, 26, 30, false)
+
+btnStart.MouseButton1Click:Connect(startWatch)
+btnStop.MouseButton1Click:Connect(stopWatch)
+btnPause.MouseButton1Click:Connect(function()
+    State.paused = not State.paused
+    btnPause.Text = State.paused and T.resume or T.pause
+    btnPause.BackgroundColor3 = State.paused and WHITE or BG_PANEL
+    btnPause.BackgroundTransparency = State.paused and 0 or 0.05
+    btnPause.TextColor3 = State.paused and Color3.fromRGB(15, 15, 15) or GRAY_TEXT
+end)
+btnClear.MouseButton1Click:Connect(function()
+    State.entries = {}
+    refreshLogUI()
+end)
+btnCopy.MouseButton1Click:Connect(function()
+    setclipboard(table.concat(State.entries, "\n"))
+    addLog("[OK] Log copiado al portapapeles.")
+end)
+
+-- Log visible
+scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, -16, 0, 118)
+scroll.Position = UDim2.new(0, 8, 0, 48)
+scroll.BackgroundColor3 = Color3.fromRGB(8, 8, 9)
+scroll.BackgroundTransparency = 0.1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 3
+scroll.ScrollBarImageColor3 = GRAY_TEXT
+scroll.CanvasSize = UDim2.new(0, 0, 6, 0)
+scroll.Parent = frame
+Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 8)
+
+logLabel = Instance.new("TextLabel")
+logLabel.Size = UDim2.new(1, -8, 6, 0)
+logLabel.Position = UDim2.new(0, 4, 0, 4)
+logLabel.BackgroundTransparency = 1
+logLabel.Text = T.logPlaceholder
+logLabel.Font = Enum.Font.Code
+logLabel.TextSize = 8
+logLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+logLabel.TextXAlignment = Enum.TextXAlignment.Left
+logLabel.TextYAlignment = Enum.TextYAlignment.Top
+logLabel.TextWrapped = true
+logLabel.Parent = scroll
+
+local function makeSeparator(y)
+    local sep = Instance.new("Frame")
+    sep.Size = UDim2.new(1, -20, 0, 1)
+    sep.Position = UDim2.new(0, 10, 0, y)
+    sep.BackgroundColor3 = GRAY_DARK
+    sep.BackgroundTransparency = 0.3
+    sep.BorderSizePixel = 0
+    sep.Parent = frame
+    return sep
+end
+
+local function makeLabel(text, y)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -16, 0, 12)
+    l.Position = UDim2.new(0, 8, 0, y)
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.Font = Enum.Font.Gotham
+    l.TextSize = 7
+    l.TextColor3 = GRAY_TEXT
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = frame
+    return l
+end
+
+local function makeInput(y, placeholder)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -16, 0, 20)
+    box.Position = UDim2.new(0, 8, 0, y)
+    box.BackgroundColor3 = BG_PANEL
+    box.BackgroundTransparency = 0.05
+    box.BorderSizePixel = 0
+    box.PlaceholderText = placeholder
+    box.PlaceholderColor3 = Color3.fromRGB(120, 120, 125)
+    box.Text = ""
+    box.Font = Enum.Font.Code
+    box.TextSize = 8
+    box.TextColor3 = WHITE
+    box.ClearTextOnFocus = false
+    box.Parent = frame
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    local st = Instance.new("UIStroke")
+    st.Thickness = 1
+    st.Color = WHITE
+    st.Transparency = 0.8
+    st.Parent = box
+    return box
+end
+
+local function makeWideBtn(text, y, primary)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, -16, 0, 20)
+    b.Position = UDim2.new(0, 8, 0, y)
+    b.BackgroundColor3 = primary and WHITE or BG_PANEL
+    b.BackgroundTransparency = primary and 0 or 0.05
+    b.BorderSizePixel = 0
+    b.Text = text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 8
+    b.TextColor3 = primary and Color3.fromRGB(15, 15, 15) or GRAY_TEXT
+    b.Parent = frame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+    local st = Instance.new("UIStroke")
+    st.Thickness = 1
+    st.Color = WHITE
+    st.Transparency = primary and 1 or 0.75
+    st.Parent = b
+    return b
+end
+
+makeSeparator(174)
+makeLabel(T.sectionB, 180)
+local inputB = makeInput(194, T.placeholderB)
+local btnScanOne = makeWideBtn(T.scanOne, 216, false)
+local btnScanAll = makeWideBtn(T.scanAll, 240, false)
+
+btnScanOne.MouseButton1Click:Connect(function()
+    local id = inputB.Text
+    if id == "" then
+        addLog("[ERROR] Pegá un SoundId en el campo de arriba, o usá 'Buscar TODOS'.")
+        return
+    end
+    scanRootsForIds({ id })
+end)
+
+btnScanAll.MouseButton1Click:Connect(function()
+    if #State.capturedOrder == 0 then
+        addLog("[ERROR] Todavía no capturaste ningún SoundId con la Sección A.")
+        return
+    end
+    scanRootsForIds(State.capturedOrder)
+end)
+
+makeSeparator(266)
+makeLabel(T.sectionC, 272)
+local inputC = makeInput(286, T.placeholderC)
+local btnInspect = makeWideBtn(T.inspect, 308, false)
+
+btnInspect.MouseButton1Click:Connect(function()
+    inspectModule(inputC.Text)
+end)
+
+-- ── DRAG (mover libremente por la pantalla) ──────────────────
+local dragging, dragStart, startPos = false, nil, nil
+frame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+    or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = frame.Position
+    end
+end)
+frame.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+    or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+game:GetService("UserInputService").InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.Touch
+    or input.UserInputType == Enum.UserInputType.MouseMove) then
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
